@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="rd_bg">#0C0C14</color>
+    <color name="rd_accent">#4FC3F7</color>
+    <style name="Theme.RemoteDesktop" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/rd_bg</item>
+        <item name="android:navigationBarColor">@color/rd_bg</item>
+        <item name="android:windowBackground">@color/rd_bg</item>
+    </style>
+</resources>
