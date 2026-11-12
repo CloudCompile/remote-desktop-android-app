@@ -19,6 +19,7 @@
             android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density"
             android:launchMode="singleTask"
+            android:supportsPictureInPicture="true"
             android:theme="@style/Theme.RemoteDesktop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

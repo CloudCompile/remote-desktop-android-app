@@ -2,31 +2,27 @@ package com.cjhauser.remotedesktop
 
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.app.PictureInPictureParams
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.view.View
+import android.util.Rational
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.webkit.CookieManager
-import android.webkit.URLUtil
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.Toast
+import android.graphics.Bitmap
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -37,6 +33,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -50,16 +47,46 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
+import android.webkit.CookieManager
+import android.webkit.URLUtil
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 
 private val RdBg = Color(0xFF0C0C14)
 private val RdSurface = Color(0xFF151522)
 private val RdAccent = Color(0xFF4FC3F7)
 
+/** Compose-visible PiP state; SessionScreen hides its controls while in PiP. */
+object PipState {
+    var isInPip by mutableStateOf(false)
+}
+
 class MainActivity : ComponentActivity() {
+
+    // Mirrors the Compose session state so lifecycle callbacks can act on it.
+    private var sessionUrl: String? = null
+    private var webViewRef: android.webkit.WebView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val initialUrl = intent?.getStringExtra("url")?.takeIf { it.startsWith("http") }
+        sessionUrl = initialUrl
         setContent {
             MaterialTheme(
                 darkColorScheme(
@@ -73,35 +100,111 @@ class MainActivity : ComponentActivity() {
                 )
             ) {
                 Surface(color = MaterialTheme.colorScheme.background) {
-                    App()
+                    App(
+                        initialSession = initialUrl,
+                        onSessionChanged = { sessionUrl = it },
+                        onWebViewCreated = { webViewRef = it }
+                    )
                 }
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.getStringExtra("url")?.takeIf { it.startsWith("http") }?.let {
+            sessionUrl = it
+            setIntent(intent)
+            // Recreate compose state by simply updating the mirror; App() reads
+            // the session from its own state, so force a compose restart.
+            recreate()
+        }
+    }
+
+    /** Going Home mid-session keeps the desktop alive in a floating window. */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (sessionUrl != null && !isInPictureInPictureMode && canEnterPip()) {
+            runCatching { enterPictureInPictureMode(pipParams()) }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        PipState.isInPip = isInPictureInPictureMode
+    }
+
+    private fun canEnterPip(): Boolean =
+        packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    /** Aspect ratio matches the desktop viewport so PiP shows the whole screen. */
+    private fun pipParams(): PictureInPictureParams {
+        val wv = webViewRef
+        val w = wv?.width ?: 16
+        val h = wv?.height ?: 9
+        val ratio = if (w > 0 && h > 0) {
+            runCatching { Rational(w, h) }.getOrNull() ?: Rational(16, 9)
+        } else Rational(16, 9)
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(ratio)
+            .build()
+    }
 }
 
+// ----------------------------------------------------------------------------------
+// App root
+// ----------------------------------------------------------------------------------
+
 @Composable
-fun App() {
+fun App(
+    initialSession: String?,
+    onSessionChanged: (String?) -> Unit,
+    onWebViewCreated: (android.webkit.WebView?) -> Unit
+) {
     val context = LocalContext.current
     var connections by remember { mutableStateOf<List<Connection>>(ConnectionStore.load(context)) }
-    var sessionUrl by remember { mutableStateOf<String?>(null) }
+    var sessionUrl by remember { mutableStateOf(initialSession) }
+
+    fun enterSession(url: String) {
+        sessionUrl = url
+        onSessionChanged(url)
+    }
+
+    fun leaveSession() {
+        connections = ConnectionStore.load(context)
+        sessionUrl = null
+        onSessionChanged(null)
+    }
+
+    // Long-press the app icon: one shortcut per saved server.
+    LaunchedEffect(connections) {
+        if (connections.isEmpty()) return@LaunchedEffect
+        val icon = IconCompat.createWithResource(context, R.drawable.ic_launcher_foreground)
+        val shortcuts = connections.take(4).map { conn ->
+            val intent = Intent(context, MainActivity::class.java).apply {
+                action = "com.cjhauser.remotedesktop.CONNECT"
+                putExtra("url", conn.url)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            ShortcutInfoCompat.Builder(context, conn.url)
+                .setShortLabel(conn.name)
+                .setIcon(icon)
+                .setIntent(intent)
+                .build()
+        }
+        ShortcutManagerCompat.setDynamicShortcuts(context, shortcuts)
+    }
 
     if (sessionUrl != null) {
-        SessionScreen(url = sessionUrl!!) {
-            // returning from a session: refresh the saved list (a quick-connect
-            // may have been persisted from SessionScreen's leave path)
-            connections = ConnectionStore.load(context)
-            sessionUrl = null
-        }
+        SessionScreen(
+            url = sessionUrl!!,
+            onWebViewCreated = onWebViewCreated,
+            onLeave = { leaveSession() }
+        )
     } else {
         ConnectionsScreen(
             connections = connections,
-            onConnect = { url ->
-                sessionUrl = url
-            },
-            onSave = { name, url ->
-                connections = ConnectionStore.upsert(context, Connection(name = name, url = url))
-            },
+            onConnect = { url -> enterSession(url) },
             onDelete = { conn ->
                 connections = ConnectionStore.remove(context, conn.url)
             }
@@ -117,10 +220,8 @@ fun App() {
 fun ConnectionsScreen(
     connections: List<Connection>,
     onConnect: (String) -> Unit,
-    onSave: (String, String) -> Unit,
     onDelete: (Connection) -> Unit
 ) {
-    var showAdd by remember { mutableStateOf(false) }
     var quickUrl by remember { mutableStateOf("") }
 
     Column(
@@ -140,7 +241,6 @@ fun ConnectionsScreen(
             modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
         )
 
-        // Quick connect
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = quickUrl,
@@ -156,7 +256,7 @@ fun ConnectionsScreen(
                 val target = quickUrl.trim().trimEnd('/')
                 if (target.isNotBlank()) onConnect(target)
             }) {
-                Icon(Icons.Default.ArrowForward, "Connect")
+                Icon(Icons.AutoMirrored.Filled.ArrowForward, "Connect")
             }
         }
 
@@ -170,7 +270,7 @@ fun ConnectionsScreen(
         if (connections.isEmpty()) {
             Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
                 Text(
-                    "No saved servers yet.\nConnect once and it will be saved.",
+                    "No saved servers yet.\nConnect once and it will be saved — and appear\nas a long-press shortcut on the app icon.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 13.sp,
                     lineHeight = 18.sp
@@ -183,9 +283,7 @@ fun ConnectionsScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable {
-                            onConnect(conn.url)
-                        }
+                        .clickable { onConnect(conn.url) }
                         .padding(vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -214,68 +312,24 @@ fun ConnectionsScreen(
             }
         }
     }
-
-    if (showAdd) {
-        AddConnectionDialog(
-            onDismiss = { showAdd = false },
-            onSave = { name, url ->
-                onSave(name, url)
-                showAdd = false
-            }
-        )
-    }
-}
-
-@Composable
-fun AddConnectionDialog(onDismiss: () -> Unit, onSave: (String, String) -> Unit) {
-    var name by remember { mutableStateOf("") }
-    var url by remember { mutableStateOf("http://") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Save connection") },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("Name (e.g. Home desktop)") },
-                    singleLine = true
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = url,
-                    onValueChange = { url = it },
-                    label = { Text("Server URL") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                val cleanUrl = url.trim().trimEnd('/')
-                if (cleanUrl.startsWith("http")) onSave(name.ifBlank { cleanUrl }, cleanUrl)
-            }) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        }
-    )
 }
 
 // ----------------------------------------------------------------------------------
-// Session screen — fullscreen WebView running the server's noVNC UI
+// Session screen — immersive WebView running the server's noVNC UI
 // ----------------------------------------------------------------------------------
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun SessionScreen(url: String, onLeave: () -> Unit) {
+fun SessionScreen(url: String, onWebViewCreated: (android.webkit.WebView?) -> Unit, onLeave: () -> Unit) {
     val context = LocalContext.current
     val activity = context as? ComponentActivity
 
-    var webView by remember { mutableStateOf<WebView?>(null) }
+    var webView by remember { mutableStateOf<android.webkit.WebView?>(null) }
     var showLeaveConfirm by remember { mutableStateOf(false) }
+    var busyClipboard by remember { mutableStateOf(false) }
     var pendingUpload by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+    val inPip = PipState.isInPip
+
     val uploadLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -284,10 +338,17 @@ fun SessionScreen(url: String, onLeave: () -> Unit) {
         pendingUpload = null
     }
 
-    // Immersive + keep screen on for the whole session.
+    // ---- Immersive set-up: cutout-to-edge, keyboard never resizes the view ----
     DisposableEffect(url) {
         val window = activity?.window
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && window != null) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         val controller = window?.let {
             androidx.core.view.WindowCompat.getInsetsController(it, it.decorView)
         }
@@ -296,22 +357,83 @@ fun SessionScreen(url: String, onLeave: () -> Unit) {
             androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         onDispose {
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && window != null) {
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                }
+            }
             controller?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
         }
     }
 
-    // Back = confirm leave (an accidental back shouldn't drop the session).
-    BackHandler { showLeaveConfirm = true }
+    BackHandler {
+        if (!PipState.isInPip) showLeaveConfirm = true
+    }
 
     fun toggleKeyboard() {
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         val wv = webView ?: return
-        if (wv.hasFocus()) {
+        if (imm.isAcceptingText) {
             imm.hideSoftInputFromWindow(wv.windowToken, 0)
-            wv.clearFocus()
         } else {
             wv.requestFocus()
-            imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
+            imm.showSoftInput(wv, InputMethodManager.SHOW_IMPLICIT)
+        }
+    }
+
+    fun copyFromDesktop() {
+        val wv = webView ?: return
+        busyClipboard = true
+        CoroutineScope(Dispatchers.IO).launch {
+            val text = ClipboardSync.fetchRemote(wv, url)
+            withContext(Dispatchers.Main) {
+                busyClipboard = false
+                if (text != null) {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("desktop", text))
+                    Toast.makeText(context, "Copied from desktop", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Desktop clipboard is empty or unreachable", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    fun pasteToDesktop() {
+        val wv = webView ?: return
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val text = cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+        if (text.isBlank()) {
+            Toast.makeText(context, "Android clipboard is empty", Toast.LENGTH_SHORT).show()
+            return
+        }
+        busyClipboard = true
+        CoroutineScope(Dispatchers.IO).launch {
+            val ok = ClipboardSync.pushRemote(wv, url, text)
+            withContext(Dispatchers.Main) {
+                busyClipboard = false
+                Toast.makeText(
+                    context,
+                    if (ok) "Pasted to desktop" else "Could not reach the server",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    fun enterPip() {
+        val act = activity ?: return
+        runCatching {
+            val wv = webView
+            val w = wv?.width ?: 16
+            val h = wv?.height ?: 9
+            val ratio = if (w > 0 && h > 0) {
+                runCatching { Rational(w, h) }.getOrNull() ?: Rational(16, 9)
+            } else Rational(16, 9)
+            act.enterPictureInPictureMode(
+                PictureInPictureParams.Builder().setAspectRatio(ratio).build()
+            )
         }
     }
 
@@ -357,7 +479,7 @@ fun SessionScreen(url: String, onLeave: () -> Unit) {
                         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                             val scheme = request.url.scheme ?: return false
                             return when (scheme) {
-                                "http", "https" -> false // stay in the session
+                                "http", "https" -> false
                                 else -> {
                                     runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
                                     true
@@ -366,24 +488,16 @@ fun SessionScreen(url: String, onLeave: () -> Unit) {
                         }
 
                         override fun onPageStarted(view: WebView, u: String, favicon: Bitmap?) {
-                            // Persist every server the user actually logs into.
                             val root = u.removeSuffix("/").ifBlank { u }
                             val existing = ConnectionStore.load(ctx).any { root.startsWith(it.url) }
                             if (!existing && root.startsWith("http")) {
                                 val uri = Uri.parse(root)
-                                ConnectionStore.upsert(
-                                    ctx,
-                                    Connection(
-                                        name = uri.host ?: root,
-                                        url = root
-                                    )
-                                )
+                                ConnectionStore.upsert(ctx, Connection(name = uri.host ?: root, url = root))
                             }
                         }
                     }
 
                     webChromeClient = object : WebChromeClient() {
-                        // Files: noVNC uploads files from the phone to ~/Downloads
                         override fun onShowFileChooser(
                             view: WebView,
                             callback: ValueCallback<Array<Uri>>,
@@ -402,21 +516,45 @@ fun SessionScreen(url: String, onLeave: () -> Unit) {
                     }
 
                     loadUrl(url)
-                }.also { webView = it }
+                }.also {
+                    webView = it
+                    onWebViewCreated(it)
+                }
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Floating keyboard toggle — the desktop UI has a keyboard button in its
-        // toolbar too, but this one works even when the toolbar is hidden.
-        FilledIconButton(
-            onClick = { toggleKeyboard() },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp)
-                .navigationBarsPadding()
-        ) {
-            Icon(Icons.Default.Keyboard, "Toggle keyboard")
+        // Floating session controls — hidden while in PiP (nothing to tap there).
+        if (!inPip) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp)
+                    .navigationBarsPadding(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                SmallFloatingActionButton(onClick = { toggleKeyboard() }) {
+                    Icon(Icons.Default.Keyboard, "Toggle keyboard")
+                }
+                SmallFloatingActionButton(onClick = { if (!busyClipboard) pasteToDesktop() }) {
+                    Icon(
+                        Icons.Default.ContentPaste,
+                        "Paste Android clipboard to desktop",
+                        tint = if (busyClipboard) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+                SmallFloatingActionButton(onClick = { if (!busyClipboard) copyFromDesktop() }) {
+                    Icon(
+                        Icons.Default.ContentCopy,
+                        "Copy desktop clipboard to phone",
+                        tint = if (busyClipboard) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+                SmallFloatingActionButton(onClick = { enterPip() }) {
+                    Icon(Icons.Default.PictureInPicture, "Continue in picture-in-picture")
+                }
+            }
         }
     }
 
@@ -432,5 +570,47 @@ fun SessionScreen(url: String, onLeave: () -> Unit) {
                 TextButton(onClick = { showLeaveConfirm = false }) { Text("Stay") }
             }
         )
+    }
+}
+
+/**
+ * Native clipboard sync with the remote desktop's control API. The session
+ * cookie lives in the WebView's cookie jar; reuse it verbatim as the Cookie
+ * header so no login prompt is ever needed.
+ */
+private object ClipboardSync {
+
+    private fun cookieHeader(webView: android.webkit.WebView, url: String): String =
+        CookieManager.getInstance().getCookie(url).orEmpty()
+
+    /** GET /api/clipboard -> "clipboard" field. */
+    fun fetchRemote(webView: android.webkit.WebView, baseUrl: String): String? {
+        return runCatching {
+            val conn = URL("$baseUrl/api/clipboard").openConnection() as HttpURLConnection
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            conn.setRequestProperty("Cookie", cookieHeader(webView, baseUrl))
+            conn.setRequestProperty("Accept", "application/json")
+            val body = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            JSONObject(body).optString("clipboard", "").ifBlank { null }
+        }.getOrNull()
+    }
+
+    /** POST /api/clipboard/set {"text": ...} -> sets the X clipboard. */
+    fun pushRemote(webView: android.webkit.WebView, baseUrl: String, text: String): Boolean {
+        return runCatching {
+            val conn = URL("$baseUrl/api/clipboard/set").openConnection() as HttpURLConnection
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Cookie", cookieHeader(webView, baseUrl))
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write(JSONObject().put("text", text).toString().toByteArray()) }
+            val ok = conn.responseCode in 200..299
+            conn.disconnect()
+            ok
+        }.getOrDefault(false)
     }
 }
