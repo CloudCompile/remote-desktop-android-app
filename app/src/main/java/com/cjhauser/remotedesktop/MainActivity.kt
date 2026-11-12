@@ -163,7 +163,17 @@ fun App(
 ) {
     val context = LocalContext.current
     var connections by remember { mutableStateOf<List<Connection>>(ConnectionStore.load(context)) }
-    var sessionUrl by remember { mutableStateOf(initialSession) }
+    // Auto-resume: a cold start within 15 minutes of the last session drops
+    // straight back into the desktop (the server cookie is still in the jar).
+    var sessionUrl by remember {
+        mutableStateOf(initialSession ?: ConnectionStore.resumeSession(context))
+    }
+
+    // Keep the resume marker fresh while a session is live; clears it on leave,
+    // so deliberately leaving never triggers an auto-resume.
+    LaunchedEffect(sessionUrl) {
+        ConnectionStore.rememberSession(context, sessionUrl)
+    }
 
     fun enterSession(url: String) {
         sessionUrl = url
@@ -253,8 +263,12 @@ fun ConnectionsScreen(
             )
             Spacer(Modifier.width(8.dp))
             FilledIconButton(onClick = {
-                val target = quickUrl.trim().trimEnd('/')
-                if (target.isNotBlank()) onConnect(target)
+                val raw = quickUrl.trim().trimEnd('/')
+                if (raw.isBlank()) return@FilledIconButton
+                // Accept "192.168.1.10:8090" and friends; LAN hosts are plain http.
+                val target = if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "http://$raw"
+                quickUrl = target
+                onConnect(target)
             }) {
                 Icon(Icons.AutoMirrored.Filled.ArrowForward, "Connect")
             }
@@ -517,6 +531,9 @@ fun SessionScreen(url: String, onWebViewCreated: (android.webkit.WebView?) -> Un
 
                     loadUrl(url)
                 }.also {
+                    // Focus up front so hardware keyboards and the desktop's own
+                    // key handling work without tapping the canvas first.
+                    it.requestFocus()
                     webView = it
                     onWebViewCreated(it)
                 }
